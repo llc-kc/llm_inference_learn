@@ -5,7 +5,7 @@
 DeepSeek-V4-Pro 是一个 **Mixture-of-Experts (MoE)** 模型，总参数量 **1.6T**，每 token 激活 **49B** 参数，支持 **1M token** 上下文长度。代码结构如下：
 
 ```plain
-text复制Transformer
+Transformer
 ├── ParallelEmbedding          (词汇嵌入，沿词表维度并行切分)
 │
 ├── [Block × 61层]
@@ -53,7 +53,7 @@ text复制Transformer
 传统的Residual Connection是将每层的输出直接加到输入上：
 
 ```plain
-text复制x_out = x_in + F(x_in)
+x_out = x_in + F(x_in)
 ```
 
 MCH将这种**单标量残差**扩展为一个**流形上的线性混合**，在 `hc_mult` 个并行副本之间做**线性组合**。当 `hc_mult=4` 时，每个位置维护 **4个并行状态副本**，它们之间通过一个可学习的组合矩阵进行混合。
@@ -63,7 +63,7 @@ MCH将这种**单标量残差**扩展为一个**流形上的线性混合**，在
 #### 1.1 状态初始化与传播 (`Transformer.forward`, line 806-808)
 
 ```python
-python复制# 从 embed 后，将单个状态扩展到 hc_mult 个副本
+# 从 embed 后，将单个状态扩展到 hc_mult 个副本
 h = h.unsqueeze(2).repeat(1, 1, self.hc_mult, 1)  # [B, S, hc_mult, D]
 # 每一层都返回 [B, S, hc_mult, D]
 for layer in self.layers:
@@ -77,7 +77,7 @@ logits = self.head(h, self.hc_head_fn, ...)
 每层包含两个HC阶段：**注意力前** 和 **FFN前**：
 
 ```python
-python复制def forward(self, x, start_pos, input_ids):
+def forward(self, x, start_pos, input_ids):
     residual = x                               # [B, S, hc_mult, D] 保存所有副本
     
     # ===== Attention 前的 HC 前处理 =====
@@ -100,7 +100,7 @@ python复制def forward(self, x, start_pos, input_ids):
 这是最关键的部分。`hc_mult`个副本通过一个可学习的 **mixing matrix** 进行加权组合：
 
 ```plain
-text复制输入形状: x [B, S, hc, D]
+输入形状: x [B, S, hc, D]
          hc_fn [mix_hc, hc*D]    其中 mix_hc = (2 + hc) * hc = 24
          hc_scale [3]             三个通道的缩放因子
          hc_base [mix_hc]         偏置
@@ -127,7 +127,7 @@ text复制输入形状: x [B, S, hc, D]
 #### 1.4 HC 后处理 — 从单向量扩展回多副本 (`hc_post`, line 684-687)
 
 ```plain
-text复制输出形状: x [B, S, D]          (注意力/FFN的结果)
+输出形状: x [B, S, D]          (注意力/FFN的结果)
          residual [B, S, hc, D]  (原始多副本残差)
          post [B, S, hc]         (后向权重)
          comb [B, S, hc, hc]     (组合矩阵，双重随机)
@@ -148,7 +148,7 @@ text复制输出形状: x [B, S, D]          (注意力/FFN的结果)
 在最后一层之后，需要将多副本合并回单向量来预测logits：
 
 ```python
-python复制def hc_head(self, x, hc_fn, hc_scale, hc_base):
+def hc_head(self, x, hc_fn, hc_scale, hc_base):
     # x: [B, S, hc, D]
     x = x.flatten(2).float()            # [B, S, hc*D]
     mixes = F.linear(x, hc_fn)          # [B, S, hc]
@@ -172,7 +172,7 @@ python复制def hc_head(self, x, hc_fn, hc_scale, hc_base):
 **后处理（升维）：**
 
 ```plain
-text复制Yᵢ = postᵢ · x̄ + Σ combᵢⱼ · residualⱼ
+Yᵢ = postᵢ · x̄ + Σ combᵢⱼ · residualⱼ
     ↑新信息        ↑旧信息的组合混合
 ```
 
@@ -204,7 +204,7 @@ DeepSeek-V4的注意力机制分为**三个并行组件**：
 每层固定维护一个大小为 `window_size=128` 的环形KV缓存：
 
 ```python
-python复制# 从输入到KV
+# 从输入到KV
 kv = self.wkv(x)                    # [B, S, D] → [B, S, head_dim]
 kv = self.kv_norm(kv)               # RMS归一化
 apply_rotary_emb(kv[..., -rd:], ...)# 对后64维应用RoPE
@@ -225,7 +225,7 @@ self.kv_cache[:bsz, start_pos % win] = kv.squeeze(1)  # 覆盖最旧位置
 核心思想：对连续的 `compress_ratio` 个token做**门控池化压缩**，输出一个压缩后的KV向量。
 
 ```plain
-text复制输入: K,V 序列 [长度 = L]
+输入: K,V 序列 [长度 = L]
       compress_ratio = R
 
 过程:
@@ -251,7 +251,7 @@ text复制输入: K,V 序列 [长度 = L]
 对于 `compress_ratio=4` 的层，压缩后的KV仍然太多（1M token → 250K压缩位置），不能全部参与注意力。Indexer学习一个**筛选函数**，从中选出 **top-k** 个压缩KV位置：
 
 ```python
-python复制# 独立的低秩Q投影
+# 独立的低秩Q投影
 q = self.wq_b(qr)                  # low-rank query → 64 heads × 128 dim
 q = rotate_activation(q)           # Hadamard旋转（改善量化分布）
 fp4_act_quant(q)                   # FP4量化模拟
@@ -276,7 +276,7 @@ Indexer使用**独立的低维空间**（64 head × 128 dim，对比MLA的128 he
 对于 `compress_ratio=128` 的层，1M token被压缩为约8192个KV位置，此时**不借助Indexer**，直接用公式化的索引选择：
 
 ```python
-python复制compress_topk_idxs = get_compress_topk_idxs(ratio, bsz, seqlen, start_pos, offset)
+compress_topk_idxs = get_compress_topk_idxs(ratio, bsz, seqlen, start_pos, offset)
 ```
 
 这相当于对压缩后的KV做**全注意力**（因为8192个位置对所有注意力头来说都已足够小）。
@@ -286,7 +286,7 @@ python复制compress_topk_idxs = get_compress_topk_idxs(ratio, bsz, seqlen, star
 所有61层的压缩比配置（从config.json解析）：
 
 ```plain
-text复制[128, 128, 4, 128, 4, 128, 4, 128, ... , 4, 0]
+[128, 128, 4, 128, 4, 128, 4, 128, ... , 4, 0]
      ↑         ↑         ↑              ↑    ↑
     第0层     第2层     第4层        第59层  第60层
 ```
@@ -294,7 +294,7 @@ text复制[128, 128, 4, 128, 4, 128, 4, 128, ... , 4, 0]
 具体合并时：
 
 ```python
-python复制# 1. 窗口内KV（当前128个token）—— 全精度
+# 1. 窗口内KV（当前128个token）—— 全精度
 topk_idxs = get_window_topk_idxs(win, bsz, seqlen, start_pos)
 
 # 2. 压缩KV索引
@@ -322,7 +322,7 @@ o = sparse_attn(q, kv_cache, attn_sink, topk_idxs, softmax_scale)
 注意力的核心采用MLA架构（第436-543行）：
 
 ```python
-python复制# Q: 低秩分解 (dim → q_lora_rank → n_heads * head_dim)
+# Q: 低秩分解 (dim → q_lora_rank → n_heads * head_dim)
 qr = self.q_norm(self.wq_a(x))       # 7168 → 1536 (低秩)
 q = self.wq_b(qr)                    # 1536 → 128*512 = 65536
 q *= rsqrt(q.square().mean(-1) + eps) # QK归一化
@@ -360,7 +360,7 @@ MLA的关键特点是：
 ### 3.1 门控机制 (`Gate`类，line 546-584)
 
 ```python
-python复制scores = linear(x, self.weight)      # 路由分数
+scores = linear(x, self.weight)      # 路由分数
 if score_func == "sqrtsoftplus":
     scores = F.softplus(scores).sqrt()  # √softplus 激活
 # bias只影响topk选择，不影响路由权重
@@ -374,7 +374,7 @@ weights *= route_scale(2.5)           # 路由缩放
 前3层 (`n_hash_layers=3`) 使用**哈希路由**——专家索引由token ID预先决定，不做学习：
 
 ```python
-python复制if self.hash:
+if self.hash:
     indices = self.tid2eid[input_ids]  # 查表得到预分配的专家
 ```
 
@@ -383,7 +383,7 @@ python复制if self.hash:
 每个专家是SwiGLU FFN，在FP4精度下存储和计算：
 
 ```python
-python复制def forward(self, x, weights=None):
+def forward(self, x, weights=None):
     gate = self.w1(x).float()    # Linear in FP4
     up = self.w3(x).float()      # Linear in FP4
     # SwiGLU: x = SiLU(gate) * up
@@ -400,7 +400,7 @@ python复制def forward(self, x, weights=None):
 384个专家沿tensor parallelism维度切分，每个rank负责 `384 // world_size` 个专家。使用 `bincount` 统计每个专家被选中的次数，只激活非空专家：
 
 ```python
-python复制counts = torch.bincount(indices.flatten(), minlength=n_routed_experts)
+counts = torch.bincount(indices.flatten(), minlength=n_routed_experts)
 for i in range(experts_start_idx, experts_end_idx):
     if counts[i] == 0: continue
     idx, top = torch.where(indices == i)
@@ -410,7 +410,7 @@ for i in range(experts_start_idx, experts_end_idx):
 最后加上共享专家的输出：
 
 ```python
-python复制y += self.shared_experts(x)  # 共享专家对所有token都激活
+y += self.shared_experts(x)  # 共享专家对所有token都激活
 ```
 
 ------
@@ -445,7 +445,7 @@ python复制y += self.shared_experts(x)  # 共享专家对所有token都激活
 在最后一层之后有一个额外的 `MTPBlock`（第739-767行），用于同时预测下一个token和后续token：
 
 ```python
-python复制def forward(self, x, start_pos, input_ids):
+def forward(self, x, start_pos, input_ids):
     e = self.embed(input_ids)             # 输入token嵌入
     e = self.enorm(e)                     # 嵌入归一化
     x = self.hnorm(x)                     # 隐藏状态归一化
@@ -464,7 +464,7 @@ MTP通过任务特定的HC head（独立的`hc_head_fn`参数）预测logits。
 DeepSeek-V4使用YaRN（Yet another RoPE extensioN）将上下文从65536扩展到100万：
 
 ```python
-python复制# 频率插值
+# 频率插值
 freqs = 1.0 / (base ** (torch.arange(0, dim, 2) / dim))
 if original_seq_len > 0:
     low, high = find_correction_range(beta_fast, beta_slow, ...)
