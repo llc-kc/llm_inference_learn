@@ -309,12 +309,15 @@ class Compressor(nn.Module):
         self.freqs_cis: torch.Tensor = None
 
     def overlap_transform(self, tensor: torch.Tensor, value=0):
-        # tensor: [b,s,r,2d]
+        # tensor: [bsz, seqlen//ratio, ratio, 2 * head_dim]
         b, s, _, _ = tensor.size()
         ratio, d = self.compress_ratio, self.head_dim
         new_tensor = tensor.new_full((b, s, 2 * ratio, d), value)
+        # 当前窗口的head后半部分
         new_tensor[:, :, ratio:] = tensor[:, :, :, d:]
+        # 前一个窗口的head前半部分
         new_tensor[:, 1:, :ratio] = tensor[:, :-1, :, :d]
+        # 完成后的shape: [bsz, seqlen//ratio, 2 * ratio, head_dim]
         return new_tensor
 
     def forward(self, x: torch.Tensor, start_pos: int):
@@ -324,10 +327,11 @@ class Compressor(nn.Module):
         dtype = x.dtype
         # compression need fp32
         x = x.float()
-        # kv shape: [b, s, coff*d]
+        # kv shape: [b, seqlen, coff*d]
         kv = self.wkv(x)
         score = self.wgate(x)
         if start_pos == 0:
+            # start_pos == 0为prefill阶段,一次性处理[0, seqlen)范围的token
             should_compress = seqlen >= ratio
             remainder = seqlen % ratio
             cutoff = seqlen - remainder
@@ -344,30 +348,39 @@ class Compressor(nn.Module):
                 kv, self.kv_state[:bsz, offset : offset+remainder] = kv.split([cutoff, remainder], dim=1)
                 self.score_state[:bsz, offset : offset+remainder] = score[:, cutoff:] + self.ape[:remainder]
                 score = score[:, :cutoff]
+            # 完成后kv和score shape: [bsz, seqlen//ratio, ratio, coff * head_dim]
             kv = kv.unflatten(1, (-1, ratio))
             score = score.unflatten(1, (-1, ratio)) + self.ape
             if overlap:
-                # 完成后kv shape: [bsz, seqlen//ratio, 2*ratio, head_dim]
+                # 完成后kv和score shape: [bsz, seqlen//ratio, 2*ratio, head_dim]
                 kv = self.overlap_transform(kv, 0)
                 score = self.overlap_transform(score, float("-inf"))
+            # 利用score进行softmax得到概率分布，对kv进行加权，在compress_ratio维度上进行求和
             # 完成后kv shape: [bsz, seqlen//ratio, head_dim]
             kv = (kv * score.softmax(dim=2)).sum(dim=2)
         else:
+            # start_pos != 0为decode阶段，每次处理start_pos=seqlen-1的一个token
+            # 当当前token是压缩窗口的最后一个token时，进行压缩
             should_compress = (start_pos + 1) % self.compress_ratio == 0
             score += self.ape[start_pos % ratio]
             if overlap:
                 self.kv_state[:bsz, ratio + start_pos % ratio] = kv.squeeze(1)
                 self.score_state[:bsz, ratio + start_pos % ratio] = score.squeeze(1)
                 if should_compress:
+                    # 与overlap_transform变化一样，拼接前一个窗口和当前窗口的信息，不过前后窗口各拿取一半信息
+                    # 前一个窗口取了前半部分head部分，当前窗口取了后半部分head
                     kv_state = torch.cat([self.kv_state[:bsz, :ratio, :d], self.kv_state[:bsz, ratio:, d:]], dim=1)
                     score_state = torch.cat([self.score_state[:bsz, :ratio, :d], self.score_state[:bsz, ratio:, d:]], dim=1)
+                    # 利用score进行softmax得到概率分布，对kv进行加权，在compress_ratio维度上进行求和
                     kv = (kv_state * score_state.softmax(dim=1)).sum(dim=1, keepdim=True)
+                    # 压缩kv后，把后一个窗口的信息移动到之前的窗口，为下一个窗口计算腾出位置
                     self.kv_state[:bsz, :ratio] = self.kv_state[:bsz, ratio:]
                     self.score_state[:bsz, :ratio] = self.score_state[:bsz, ratio:]
             else:
                 self.kv_state[:bsz, start_pos % ratio] = kv.squeeze(1)
                 self.score_state[:bsz, start_pos % ratio] = score.squeeze(1)
                 if should_compress:
+                    # 利用score进行softmax得到概率分布，对kv进行加权，在compress_ratio维度上进行求和
                     kv = (self.kv_state[:bsz] * self.score_state[:bsz].softmax(dim=1)).sum(dim=1, keepdim=True)
         if not should_compress:
             return
