@@ -845,8 +845,10 @@ class Transformer(nn.Module):
 
     @torch.inference_mode()
     def forward(self, input_ids: torch.Tensor, start_pos: int = 0):
+        # 完成后shape: [batch_size, seq_len, dim]
         h = self.embed(input_ids)
         # Expand to hc_mult copies for Hyper-Connections
+        # 完成后shape: [batch_size, seq_len, hc_mult, dim]
         h = h.unsqueeze(2).repeat(1, 1, self.hc_mult, 1)
         for layer in self.layers:
             h = layer(h, start_pos, input_ids)
