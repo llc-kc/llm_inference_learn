@@ -459,9 +459,6 @@ class Indexer(torch.nn.Module):
             index_score += torch.where(mask, float("-inf"), 0)
         topk_idxs = index_score.topk(min(self.index_topk, end_pos // ratio), dim=-1)[1]
 
-        # topk_idxs 选中的是压缩 KV Cache 内部 的索引（范围 [0, end_pos//ratio) ），
-        # 这段代码给它加上 offset （压缩区域在完整 KV Cache 中的起始偏移），将其映射为完整的全局索引；
-        # 同时，prefill 阶段把任何违反因果律（选了"未来"位置）的结果设为 -1 。
         if start_pos == 0:
             mask = topk_idxs >= torch.arange(1, seqlen + 1).unsqueeze(1) // ratio
             topk_idxs = torch.where(mask, -1, topk_idxs + offset)
@@ -506,7 +503,7 @@ class Attention(nn.Module):
                 self.indexer = Indexer(args, self.compress_ratio)
             else:
                 self.indexer = None
-		# window_size��SWA�Ĵ��ڴ�С��kv cache buffer���������û��λ�������д��
+		# window_size为SWA的存储空间，以及C4A/C128A的kv 存储空间
         kv_cache_size = args.window_size + (args.max_seq_len // self.compress_ratio if self.compress_ratio else 0)
         self.register_buffer("kv_cache", torch.zeros(args.max_batch_size, kv_cache_size, self.head_dim), persistent=False)
         if self.compress_ratio:
@@ -541,22 +538,30 @@ class Attention(nn.Module):
         apply_rotary_emb(kv[..., -rd:], freqs_cis)
         # FP8-simulate non-rope dims to match QAT; rope dims stay bf16 for positional precision
         act_quant(kv[..., :-rd], 64, scale_fmt, scale_dtype, True)
+        # SWA get_window_topk_idxs 根据滑动窗口大小 win ，生成当前 token 在 KV cache 中 最近 win 个 token 的索引
         topk_idxs = get_window_topk_idxs(win, bsz, seqlen, start_pos)
         if self.compress_ratio:
+            # 当 compress_ratio 不为 None 时，除了滑动窗口内的 token，
+            # 还需要从更远的历史中挑选一部分 token 参与注意力计算 ——这就是"压缩注意力"机制
+            # offset是根据下面sparse_attn计算前的处理来的
+            # Prefill 时，原始 kv （ seqlen 个 token）和压缩后的 kv_compress （ seqlen//ratio 个 token）被 直接拼接 成一个临时张量传给 sparse_attn 。此时压缩 KV 在拼接张量中的起始位置就是 seqlen
+            # Decode 时直接传入整个 kv_cache ，压缩 KV 固定在 win 位置之后：
             offset = kv.size(1) if start_pos == 0 else win
             if self.indexer is not None:
                 compress_topk_idxs = self.indexer(x, qr, start_pos, offset)
             else:
                 compress_topk_idxs = get_compress_topk_idxs(ratio, bsz, seqlen, start_pos, offset)
             topk_idxs = torch.cat([topk_idxs, compress_topk_idxs], dim=-1)
+        # topk_idxs为两个部分的拼接，可能存在重复的token吧？
         topk_idxs = topk_idxs.int()
 
         # compress kv & attn
         if start_pos == 0:
+            # start_pos == 0 means prefill stage
+            # 填充SWA的部分，kv_cache前半部分存储win token个原始kv，超过win采用环形覆盖，避免每增加一个token整体kv前移
             if seqlen <= win:
                 self.kv_cache[:bsz, :seqlen] = kv
             else:
-				# start_pos == 0Ϊprefill�׶Σ�ֻ������� window_size �� token������ cutoff ���뵽��ʼλ��
                 cutoff = seqlen % win
                 self.kv_cache[:bsz, cutoff: win], self.kv_cache[:bsz, :cutoff] = kv[:, -win:].split([win - cutoff, cutoff], dim=1)
             if self.compress_ratio:
@@ -565,7 +570,8 @@ class Attention(nn.Module):
             # We performed QAT here, kv could also use fp8 format, though current implementation uses bf16
             o = sparse_attn(q, kv, self.attn_sink, topk_idxs, self.softmax_scale)
         else:
-			# decode�׶Σ�ÿ��д��һ��λ��
+			# decode stage
+            # 填充SWA的部分，采用环形覆盖，start_pos % win为当前token在window_size中的位置，避免每增加一个token整体kv前移
             self.kv_cache[:bsz, start_pos % win] = kv.squeeze(1)
             if self.compress_ratio:
                 self.compressor(x, start_pos)
