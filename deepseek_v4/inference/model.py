@@ -423,6 +423,7 @@ class Indexer(torch.nn.Module):
         self.softmax_scale = self.head_dim ** -0.5
         self.compress_ratio = compress_ratio
 
+        # ratate = True, 采用FP4量化
         self.compressor = Compressor(args, compress_ratio, self.head_dim, True)
         self.register_buffer("kv_cache", torch.zeros(args.max_batch_size, args.max_seq_len // compress_ratio, self.head_dim), persistent=False)
         self.freqs_cis = None
@@ -445,7 +446,11 @@ class Indexer(torch.nn.Module):
         self.compressor(x, start_pos)
         weights = self.weights_proj(x) * (self.softmax_scale * self.n_heads ** -0.5)
         # We performed QAT here, kv could also use fp8 format, though current implementation uses bf16
+        # q: (bsz, seqlen, n_local_heads, head_dim)
+        # kv_cache: [bsz, seqlen//ratio, head_dim]
+        # 进行MQA计算，完成后index_score: [bsz, seqlen, n_local_heads, seqlen//ratio]
         index_score = torch.einsum("bshd,btd->bsht", q, self.kv_cache[:bsz, :end_pos // ratio])
+        # 对index_score进行ReLU激活，对每个head进行加权求和，得到[bsz, seqlen, seqlen//ratio]的张量
         index_score = (index_score.relu_() * weights.unsqueeze(-1)).sum(dim=2)
         if world_size > 1:
             dist.all_reduce(index_score)
@@ -453,6 +458,10 @@ class Indexer(torch.nn.Module):
             mask = torch.arange(seqlen // ratio).repeat(seqlen, 1) >= torch.arange(1, seqlen + 1).unsqueeze(1) // ratio
             index_score += torch.where(mask, float("-inf"), 0)
         topk_idxs = index_score.topk(min(self.index_topk, end_pos // ratio), dim=-1)[1]
+
+        # topk_idxs 选中的是压缩 KV Cache 内部 的索引（范围 [0, end_pos//ratio) ），
+        # 这段代码给它加上 offset （压缩区域在完整 KV Cache 中的起始偏移），将其映射为完整的全局索引；
+        # 同时，prefill 阶段把任何违反因果律（选了"未来"位置）的结果设为 -1 。
         if start_pos == 0:
             mask = topk_idxs >= torch.arange(1, seqlen + 1).unsqueeze(1) // ratio
             topk_idxs = torch.where(mask, -1, topk_idxs + offset)
